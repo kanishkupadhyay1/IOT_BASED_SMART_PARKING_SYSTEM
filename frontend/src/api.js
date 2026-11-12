@@ -5,9 +5,17 @@ async function request(path, options = {}) {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
-  const data = await res.json();
+  const rawText = await res.text();
+  let data = {};
+  if (rawText) {
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      throw new Error(res.ok ? 'Invalid JSON response from server' : `Server error (${res.status})`);
+    }
+  }
   if (!res.ok) {
-    throw new Error(data.error || 'Request failed');
+    throw new Error(data.error || `Request failed (${res.status})`);
   }
   return data;
 }
