@@ -1,22 +1,4 @@
-import { ParkingSlot } from '../models/ParkingSlot.js';
-import { ParkingRecord } from '../models/ParkingRecord.js';
-
-const INITIAL_SLOTS = [
-  { slotId: 'P1', sensorId: 'Motion Detector 1' },
-  { slotId: 'P2', sensorId: 'Motion Detector 2' },
-  { slotId: 'P3', sensorId: 'Motion Detector 3' },
-  { slotId: 'P4', sensorId: 'Motion Detector 4' },
-  { slotId: 'P5', sensorId: 'Motion Detector 5' },
-];
-
-const AUTHORIZED_RFIDS = new Set([
-  'RFID-101',
-  'RFID-102',
-  'RFID-103',
-  'RFID-104',
-  'RFID-105',
-  'RFID-ADMIN',
-]);
+import { getDb, initDatabase } from '../db/database.js';
 
 export function formatDuration(seconds) {
   if (seconds == null || seconds < 0) return '0s';
@@ -28,86 +10,110 @@ export function formatDuration(seconds) {
   return `${secs}s`;
 }
 
+function mapSlotRow(row) {
+  return {
+    slotId: row.slot_id,
+    sensorId: row.sensor_id,
+    status: row.status,
+    sensorState: row.sensor_state,
+    vehicleId: row.vehicle_id,
+    rfidTag: row.rfid_card_id,
+    occupiedSince: row.entry_time,
+    lastUpdated: row.last_updated,
+  };
+}
+
+function mapRecordRow(row) {
+  return {
+    _id: `rec-${row.record_id}`,
+    recordId: row.record_id,
+    vehicleId: row.vehicle_id,
+    rfidTag: row.rfid_card_id,
+    slotId: row.slot_id,
+    entryTime: row.entry_time,
+    exitTime: row.exit_time,
+    durationMinutes: row.duration_minutes,
+    durationFormatted: row.duration_formatted,
+    status: row.status,
+  };
+}
+
 class ParkingStore {
-  constructor() {
-    this.useMongo = false;
-    this.gateStatus = 'CLOSED';
-    this.rfidStatus = 'IDLE';
-    this.lastRfidTag = null;
-    this.lastEvent = {
-      type: 'SYSTEM_READY',
-      message: 'Smart Parking Management System initialized',
-      timestamp: new Date().toISOString(),
-    };
-    this.memorySlots = INITIAL_SLOTS.map((s) => ({
-      ...s,
-      status: 'vacant',
-      sensorState: 'LOW',
-      vehicleId: null,
-      rfidTag: null,
-      occupiedSince: null,
-    }));
-    this.memoryRecords = [];
-    this.recordCounter = 1;
+  init() {
+    initDatabase();
   }
 
-  async init(useMongo) {
-    this.useMongo = Boolean(useMongo);
-    if (this.useMongo) {
-      for (const slot of INITIAL_SLOTS) {
-        await ParkingSlot.updateOne(
-          { slotId: slot.slotId },
-          { $setOnInsert: { ...slot, status: 'vacant', sensorState: 'LOW' } },
-          { upsert: true }
-        );
-      }
-    }
+  getStateValue(db, key, fallback = null) {
+    const row = db.prepare('SELECT value FROM SystemState WHERE key = ?').get(key);
+    return row ? row.value : fallback;
   }
 
-  recordEvent(type, message) {
-    this.lastEvent = {
-      type,
-      message,
-      timestamp: new Date().toISOString(),
-    };
-    return this.lastEvent;
+  setStateValue(db, key, value) {
+    db.prepare(`
+      INSERT INTO SystemState (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(key, value ?? '');
   }
 
-  async getSlots() {
-    if (this.useMongo) {
-      const docs = await ParkingSlot.find().sort({ slotId: 1 }).lean();
-      return docs;
-    }
-    return this.memorySlots.map((s) => ({ ...s }));
+  insertEvent(db, { eventType, vehicleId = null, slotId = null, description, timestamp }) {
+    db.prepare(`
+      INSERT INTO ParkingEvents (event_type, vehicle_id, slot_id, description, timestamp)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(eventType, vehicleId, slotId, description, timestamp || new Date().toISOString());
   }
 
-  async getHistory(limit = 50) {
-    if (this.useMongo) {
-      return ParkingRecord.find().sort({ entryTime: -1 }).limit(limit).lean();
-    }
-    return [...this.memoryRecords]
-      .sort((a, b) => new Date(b.entryTime) - new Date(a.entryTime))
-      .slice(0, limit);
+  getSlots() {
+    const db = getDb();
+    const rows = db.prepare('SELECT * FROM ParkingSlots ORDER BY slot_id ASC').all();
+    return rows.map(mapSlotRow);
   }
 
-  async getDashboardState() {
-    const slots = await this.getSlots();
-    const history = await this.getHistory(50);
+  getHistory(limit = 50) {
+    const db = getDb();
+    const rows = db
+      .prepare('SELECT * FROM ParkingRecords ORDER BY entry_time DESC, record_id DESC LIMIT ?')
+      .all(limit);
+    return rows.map(mapRecordRow);
+  }
+
+  getDashboardState() {
+    const db = getDb();
+    const slots = this.getSlots();
+    const history = this.getHistory(50);
+
     const totalCapacity = slots.length;
     const occupiedSlots = slots.filter((s) => s.status === 'occupied').length;
     const availableSlots = totalCapacity - occupiedSlots;
     const occupancyRate = totalCapacity > 0 ? Math.round((occupiedSlots / totalCapacity) * 100) : 0;
+
+    const gateRow = db.prepare("SELECT status FROM Gates WHERE gate_id = 'GATE-ENTRY'").get();
+    const gateStatus = gateRow ? gateRow.status : 'CLOSED';
+    const rfidStatus = this.getStateValue(db, 'rfid_status', 'IDLE') || 'IDLE';
+    const lastRfidRaw = this.getStateValue(db, 'last_rfid_tag', '');
+    const lastRfidTag = lastRfidRaw || null;
+
+    const eventRow = db
+      .prepare('SELECT event_type, description, timestamp FROM ParkingEvents ORDER BY event_id DESC LIMIT 1')
+      .get();
+
+    const lastEvent = eventRow
+      ? {
+          type: eventRow.event_type,
+          message: eventRow.description,
+          timestamp: eventRow.timestamp,
+        }
+      : null;
 
     return {
       totalCapacity,
       occupiedSlots,
       availableSlots,
       occupancyRate,
-      gateStatus: this.gateStatus,
-      rfidStatus: this.rfidStatus,
-      lastRfidTag: this.lastRfidTag,
-      lastEvent: this.lastEvent,
-      dbMode: this.useMongo ? 'mongodb' : 'memory',
+      gateStatus,
+      rfidStatus,
+      lastRfidTag,
+      lastEvent,
+      dbMode: 'sqlite',
       slots,
       history,
     };
@@ -115,282 +121,340 @@ class ParkingStore {
 
   isAuthorizedRfid(rfidTag) {
     if (!rfidTag) return false;
+    const db = getDb();
     const normalized = String(rfidTag).trim().toUpperCase();
-    return AUTHORIZED_RFIDS.has(normalized);
+    const row = db
+      .prepare('SELECT authorized FROM RegisteredVehicles WHERE rfid_card_id = ?')
+      .get(normalized);
+    return Boolean(row && row.authorized === 1);
   }
 
-  async scanRfid({ rfidTag, vehicleId }) {
+  scanRfid({ rfidTag, vehicleId }) {
     const tag = String(rfidTag || '').trim().toUpperCase();
     if (!tag) {
       throw new Error('RFID tag is required');
     }
 
-    this.lastRfidTag = tag;
-    const authorized = this.isAuthorizedRfid(tag);
+    const db = getDb();
+    const cleanVehicle = vehicleId ? String(vehicleId).trim().toUpperCase() : null;
 
-    if (!authorized) {
-      this.rfidStatus = 'UNAUTHORIZED';
-      this.gateStatus = 'CLOSED';
-      this.recordEvent(
-        'RFID_UNAUTHORIZED',
-        `Unauthorized RFID card (${tag}) detected. Entry gate remains CLOSED.`
-      );
-      return {
-        authorized: false,
-        state: await this.getDashboardState(),
-      };
-    }
+    const txResult = db.transaction(() => {
+      const now = new Date().toISOString();
+      this.setStateValue(db, 'last_rfid_tag', tag);
 
-    const slots = await this.getSlots();
-    const available = slots.find((s) => s.status === 'vacant');
-    if (!available) {
-      this.rfidStatus = 'AUTHORIZED';
-      this.gateStatus = 'CLOSED';
-      this.recordEvent(
-        'PARKING_FULL',
-        `Authorized RFID (${tag}) scanned, but all 5 slots are occupied (100% full).`
-      );
+      const registered = db
+        .prepare('SELECT authorized FROM RegisteredVehicles WHERE rfid_card_id = ?')
+        .get(tag);
+      const authorized = Boolean(registered && registered.authorized === 1);
+
+      if (!authorized) {
+        this.setStateValue(db, 'rfid_status', 'UNAUTHORIZED');
+        db.prepare("UPDATE Gates SET status = 'CLOSED', last_updated = ? WHERE gate_id = 'GATE-ENTRY'").run(now);
+        this.insertEvent(db, {
+          eventType: 'RFID_UNAUTHORIZED',
+          vehicleId: cleanVehicle,
+          description: `Unauthorized RFID card (${tag}) detected. Entry gate remains CLOSED.`,
+          timestamp: now,
+        });
+        return { authorized: false };
+      }
+
+      const available = db
+        .prepare("SELECT slot_id FROM ParkingSlots WHERE status = 'vacant' ORDER BY slot_id ASC LIMIT 1")
+        .get();
+
+      if (!available) {
+        this.setStateValue(db, 'rfid_status', 'AUTHORIZED');
+        db.prepare("UPDATE Gates SET status = 'CLOSED', last_updated = ? WHERE gate_id = 'GATE-ENTRY'").run(now);
+        this.insertEvent(db, {
+          eventType: 'PARKING_FULL',
+          vehicleId: cleanVehicle,
+          description: `Authorized RFID (${tag}) scanned, but all 5 slots are occupied (100% full).`,
+          timestamp: now,
+        });
+        return { authorized: true, parkingFull: true };
+      }
+
+      this.setStateValue(db, 'rfid_status', 'AUTHORIZED');
+      db.prepare("UPDATE Gates SET status = 'OPEN', last_updated = ? WHERE gate_id = 'GATE-ENTRY'").run(now);
+      const vehLabel = cleanVehicle ? ` for vehicle ${cleanVehicle}` : '';
+      this.insertEvent(db, {
+        eventType: 'RFID_AUTHORIZED',
+        vehicleId: cleanVehicle,
+        description: `RFID (${tag}) authorized${vehLabel}. Entry gate OPENED.`,
+        timestamp: now,
+      });
+
       return {
         authorized: true,
-        parkingFull: true,
-        state: await this.getDashboardState(),
+        parkingFull: false,
+        suggestedSlot: available.slot_id,
       };
-    }
-
-    this.rfidStatus = 'AUTHORIZED';
-    this.gateStatus = 'OPEN';
-    const vehLabel = vehicleId ? ` for vehicle ${vehicleId}` : '';
-    this.recordEvent(
-      'RFID_AUTHORIZED',
-      `RFID (${tag}) authorized${vehLabel}. Entry gate OPENED.`
-    );
+    })();
 
     return {
-      authorized: true,
-      parkingFull: false,
-      suggestedSlot: available.slotId,
-      state: await this.getDashboardState(),
+      ...txResult,
+      state: this.getDashboardState(),
     };
   }
 
-  async setGateStatus(status) {
+  setGateStatus(status) {
     const normalized = String(status || '').toUpperCase();
     if (normalized !== 'OPEN' && normalized !== 'CLOSED') {
       throw new Error('Gate status must be OPEN or CLOSED');
     }
-    this.gateStatus = normalized;
-    this.recordEvent(
-      `GATE_${normalized}`,
-      `Entry gate manually set to ${normalized}.`
-    );
+
+    const db = getDb();
+    db.transaction(() => {
+      const now = new Date().toISOString();
+      db.prepare("UPDATE Gates SET status = ?, last_updated = ? WHERE gate_id = 'GATE-ENTRY'").run(
+        normalized,
+        now
+      );
+      this.insertEvent(db, {
+        eventType: `GATE_${normalized}`,
+        description: `Entry gate manually set to ${normalized}.`,
+        timestamp: now,
+      });
+    })();
+
     return this.getDashboardState();
   }
 
-  async processEntry({ slotId, vehicleId, rfidTag }) {
-    const cleanVehicleId = String(vehicleId || '').trim().toUpperCase() || `VEH-${Math.floor(1000 + Math.random() * 9000)}`;
-    const cleanRfid = String(rfidTag || this.lastRfidTag || 'RFID-101').trim().toUpperCase();
+  processEntry({ slotId, vehicleId, rfidTag }) {
+    const db = getDb();
+    const lastRfid = this.getStateValue(db, 'last_rfid_tag', '') || 'RFID-101';
+    const cleanVehicleId =
+      String(vehicleId || '').trim().toUpperCase() ||
+      `VEH-${Math.floor(1000 + Math.random() * 9000)}`;
+    const cleanRfid = String(rfidTag || lastRfid).trim().toUpperCase();
 
-    const slots = await this.getSlots();
-    let targetSlot;
+    db.transaction(() => {
+      const now = new Date().toISOString();
 
-    if (slotId) {
-      targetSlot = slots.find((s) => s.slotId === String(slotId).toUpperCase());
+      // Prevent parking the same vehicle twice
+      const activeVehicle = db
+        .prepare("SELECT slot_id FROM ParkingRecords WHERE vehicle_id = ? AND status = 'PARKED' LIMIT 1")
+        .get(cleanVehicleId);
+      if (activeVehicle) {
+        throw new Error(`Vehicle ${cleanVehicleId} is already parked in ${activeVehicle.slot_id}`);
+      }
+
+      let targetSlot;
+      if (slotId) {
+        const normalizedSlot = String(slotId).trim().toUpperCase();
+        targetSlot = db
+          .prepare('SELECT * FROM ParkingSlots WHERE slot_id = ?')
+          .get(normalizedSlot);
+        if (!targetSlot) {
+          throw new Error(`Invalid slotId: ${slotId}`);
+        }
+        if (targetSlot.status === 'occupied') {
+          throw new Error(`Slot ${targetSlot.slot_id} is already occupied`);
+        }
+      } else {
+        targetSlot = db
+          .prepare("SELECT * FROM ParkingSlots WHERE status = 'vacant' ORDER BY slot_id ASC LIMIT 1")
+          .get();
+        if (!targetSlot) {
+          throw new Error('All 5 parking slots are occupied');
+        }
+      }
+
+      // Guard against duplicate active slot records
+      const activeSlotRecord = db
+        .prepare("SELECT record_id FROM ParkingRecords WHERE slot_id = ? AND status = 'PARKED' LIMIT 1")
+        .get(targetSlot.slot_id);
+      if (activeSlotRecord) {
+        throw new Error(`Slot ${targetSlot.slot_id} already has an active parking record`);
+      }
+
+      db.prepare(`
+        UPDATE ParkingSlots
+        SET status = 'occupied',
+            sensor_state = 'HIGH',
+            vehicle_id = ?,
+            rfid_card_id = ?,
+            entry_time = ?,
+            last_updated = ?
+        WHERE slot_id = ?
+      `).run(cleanVehicleId, cleanRfid, now, now, targetSlot.slot_id);
+
+      db.prepare(`
+        INSERT INTO ParkingRecords (
+          vehicle_id, rfid_card_id, slot_id, entry_time, duration_formatted, status
+        ) VALUES (?, ?, ?, ?, 'Active', 'PARKED')
+      `).run(cleanVehicleId, cleanRfid, targetSlot.slot_id, now);
+
+      this.setStateValue(db, 'rfid_status', 'AUTHORIZED');
+      this.setStateValue(db, 'last_rfid_tag', cleanRfid);
+      db.prepare("UPDATE Gates SET status = 'CLOSED', last_updated = ? WHERE gate_id = 'GATE-ENTRY'").run(now);
+
+      this.insertEvent(db, {
+        eventType: 'VEHICLE_ENTRY',
+        vehicleId: cleanVehicleId,
+        slotId: targetSlot.slot_id,
+        description: `Vehicle ${cleanVehicleId} parked in ${targetSlot.slot_id} (${targetSlot.sensor_id}: HIGH). Gate closed.`,
+        timestamp: now,
+      });
+    })();
+
+    return this.getDashboardState();
+  }
+
+  processExit({ slotId }) {
+    const normalizedSlot = String(slotId || '').trim().toUpperCase();
+    const db = getDb();
+
+    db.transaction(() => {
+      const targetSlot = db
+        .prepare('SELECT * FROM ParkingSlots WHERE slot_id = ?')
+        .get(normalizedSlot);
+
       if (!targetSlot) {
         throw new Error(`Invalid slotId: ${slotId}`);
       }
-      if (targetSlot.status === 'occupied') {
-        throw new Error(`Slot ${targetSlot.slotId} is already occupied`);
+      if (targetSlot.status === 'vacant') {
+        throw new Error(`Slot ${normalizedSlot} is already vacant`);
       }
-    } else {
-      targetSlot = slots.find((s) => s.status === 'vacant');
-      if (!targetSlot) {
-        throw new Error('All 5 parking slots are occupied');
+
+      const nowDate = new Date();
+      const now = nowDate.toISOString();
+      const exitingVehicleId = targetSlot.vehicle_id;
+
+      const activeRecord = db
+        .prepare(
+          "SELECT * FROM ParkingRecords WHERE slot_id = ? AND status = 'PARKED' ORDER BY record_id DESC LIMIT 1"
+        )
+        .get(normalizedSlot);
+
+      if (activeRecord) {
+        const durationSeconds = Math.max(
+          1,
+          Math.floor((nowDate.getTime() - new Date(activeRecord.entry_time).getTime()) / 1000)
+        );
+        const durationMinutes = Math.round((durationSeconds / 60) * 100) / 100;
+        const durationFormatted = formatDuration(durationSeconds);
+
+        db.prepare(`
+          UPDATE ParkingRecords
+          SET exit_time = ?,
+              duration_minutes = ?,
+              duration_formatted = ?,
+              status = 'EXITED'
+          WHERE record_id = ?
+        `).run(now, durationMinutes, durationFormatted, activeRecord.record_id);
       }
-    }
 
-    const now = new Date();
+      db.prepare(`
+        UPDATE ParkingSlots
+        SET status = 'vacant',
+            sensor_state = 'LOW',
+            vehicle_id = NULL,
+            rfid_card_id = NULL,
+            entry_time = NULL,
+            last_updated = ?
+        WHERE slot_id = ?
+      `).run(now, normalizedSlot);
 
-    if (this.useMongo) {
-      await ParkingSlot.updateOne(
-        { slotId: targetSlot.slotId },
-        {
-          $set: {
-            status: 'occupied',
-            sensorState: 'HIGH',
-            vehicleId: cleanVehicleId,
-            rfidTag: cleanRfid,
-            occupiedSince: now,
-          },
-        }
-      );
-      await ParkingRecord.create({
-        vehicleId: cleanVehicleId,
-        rfidTag: cleanRfid,
-        slotId: targetSlot.slotId,
-        entryTime: now,
-        status: 'PARKED',
-        durationFormatted: 'Active',
-      });
-    } else {
-      const memSlot = this.memorySlots.find((s) => s.slotId === targetSlot.slotId);
-      memSlot.status = 'occupied';
-      memSlot.sensorState = 'HIGH';
-      memSlot.vehicleId = cleanVehicleId;
-      memSlot.rfidTag = cleanRfid;
-      memSlot.occupiedSince = now.toISOString();
-
-      this.memoryRecords.push({
-        _id: `rec-${this.recordCounter++}`,
-        vehicleId: cleanVehicleId,
-        rfidTag: cleanRfid,
-        slotId: targetSlot.slotId,
-        entryTime: now.toISOString(),
-        exitTime: null,
-        durationSeconds: null,
-        durationFormatted: 'Active',
-        status: 'PARKED',
-      });
-    }
-
-    this.rfidStatus = 'AUTHORIZED';
-    this.lastRfidTag = cleanRfid;
-    this.gateStatus = 'CLOSED';
-    this.recordEvent(
-      'VEHICLE_ENTRY',
-      `Vehicle ${cleanVehicleId} parked in ${targetSlot.slotId} (${targetSlot.sensorId}: HIGH). Gate closed.`
-    );
-
-    return this.getDashboardState();
-  }
-
-  async processExit({ slotId }) {
-    const normalizedSlot = String(slotId || '').toUpperCase();
-    const slots = await this.getSlots();
-    const targetSlot = slots.find((s) => s.slotId === normalizedSlot);
-
-    if (!targetSlot) {
-      throw new Error(`Invalid slotId: ${slotId}`);
-    }
-    if (targetSlot.status === 'vacant') {
-      throw new Error(`Slot ${normalizedSlot} is already vacant`);
-    }
-
-    const exitingVehicleId = targetSlot.vehicleId;
-    const now = new Date();
-
-    if (this.useMongo) {
-      const activeRecord = await ParkingRecord.findOne({
+      this.insertEvent(db, {
+        eventType: 'VEHICLE_EXIT',
+        vehicleId: exitingVehicleId,
         slotId: normalizedSlot,
-        status: 'PARKED',
-      }).sort({ entryTime: -1 });
-
-      if (activeRecord) {
-        const durationSeconds = Math.max(
-          1,
-          Math.floor((now.getTime() - new Date(activeRecord.entryTime).getTime()) / 1000)
-        );
-        activeRecord.exitTime = now;
-        activeRecord.durationSeconds = durationSeconds;
-        activeRecord.durationFormatted = formatDuration(durationSeconds);
-        activeRecord.status = 'EXITED';
-        await activeRecord.save();
-      }
-
-      await ParkingSlot.updateOne(
-        { slotId: normalizedSlot },
-        {
-          $set: {
-            status: 'vacant',
-            sensorState: 'LOW',
-            vehicleId: null,
-            rfidTag: null,
-            occupiedSince: null,
-          },
-        }
-      );
-    } else {
-      const activeRecord = [...this.memoryRecords]
-        .reverse()
-        .find((r) => r.slotId === normalizedSlot && r.status === 'PARKED');
-
-      if (activeRecord) {
-        const durationSeconds = Math.max(
-          1,
-          Math.floor((now.getTime() - new Date(activeRecord.entryTime).getTime()) / 1000)
-        );
-        activeRecord.exitTime = now.toISOString();
-        activeRecord.durationSeconds = durationSeconds;
-        activeRecord.durationFormatted = formatDuration(durationSeconds);
-        activeRecord.status = 'EXITED';
-      }
-
-      const memSlot = this.memorySlots.find((s) => s.slotId === normalizedSlot);
-      memSlot.status = 'vacant';
-      memSlot.sensorState = 'LOW';
-      memSlot.vehicleId = null;
-      memSlot.rfidTag = null;
-      memSlot.occupiedSince = null;
-    }
-
-    this.recordEvent(
-      'VEHICLE_EXIT',
-      `Vehicle ${exitingVehicleId} exited ${normalizedSlot} (${targetSlot.sensorId}: LOW).`
-    );
+        description: `Vehicle ${exitingVehicleId} exited ${normalizedSlot} (${targetSlot.sensor_id}: LOW).`,
+        timestamp: now,
+      });
+    })();
 
     return this.getDashboardState();
   }
 
-  async resetAll() {
-    if (this.useMongo) {
-      await ParkingSlot.updateMany(
-        {},
-        {
-          $set: {
-            status: 'vacant',
-            sensorState: 'LOW',
-            vehicleId: null,
-            rfidTag: null,
-            occupiedSince: null,
-          },
-        }
-      );
-      await ParkingRecord.deleteMany({});
-    } else {
-      this.memorySlots = INITIAL_SLOTS.map((s) => ({
-        ...s,
-        status: 'vacant',
-        sensorState: 'LOW',
-        vehicleId: null,
-        rfidTag: null,
-        occupiedSince: null,
-      }));
-      this.memoryRecords = [];
-    }
+  resetAll() {
+    const db = getDb();
 
-    this.gateStatus = 'CLOSED';
-    this.rfidStatus = 'IDLE';
-    this.lastRfidTag = null;
-    this.recordEvent('SYSTEM_RESET', 'All 5 parking slots reset to vacant and history cleared.');
+    db.transaction(() => {
+      const now = new Date().toISOString();
+      db.prepare(`
+        UPDATE ParkingSlots
+        SET status = 'vacant',
+            sensor_state = 'LOW',
+            vehicle_id = NULL,
+            rfid_card_id = NULL,
+            entry_time = NULL,
+            last_updated = ?
+      `).run(now);
+
+      db.prepare('DELETE FROM ParkingRecords').run();
+      db.prepare("UPDATE Gates SET status = 'CLOSED', last_updated = ? WHERE gate_id = 'GATE-ENTRY'").run(now);
+      this.setStateValue(db, 'rfid_status', 'IDLE');
+      this.setStateValue(db, 'last_rfid_tag', '');
+
+      this.insertEvent(db, {
+        eventType: 'SYSTEM_RESET',
+        description: 'All 5 parking slots reset to vacant and history cleared.',
+        timestamp: now,
+      });
+    })();
 
     return this.getDashboardState();
   }
 
-  async fillAllDemo() {
-    const slots = await this.getSlots();
-    const demoVehicles = ['KA-01-AB-1024', 'KA-02-CD-2048', 'KA-03-EF-3072', 'KA-04-GH-4096', 'KA-05-IJ-5120'];
-    const demoRfids = ['RFID-101', 'RFID-102', 'RFID-103', 'RFID-104', 'RFID-105'];
+  fillAllDemo() {
+    const db = getDb();
+    const demoVehicles = [
+      { slotId: 'P1', vehicleId: 'KA-01-AB-1024', rfidTag: 'RFID-101' },
+      { slotId: 'P2', vehicleId: 'KA-02-CD-2048', rfidTag: 'RFID-102' },
+      { slotId: 'P3', vehicleId: 'KA-03-EF-3072', rfidTag: 'RFID-103' },
+      { slotId: 'P4', vehicleId: 'KA-04-GH-4096', rfidTag: 'RFID-104' },
+      { slotId: 'P5', vehicleId: 'KA-05-IJ-5120', rfidTag: 'RFID-105' },
+    ];
 
-    for (let i = 0; i < slots.length; i++) {
-      if (slots[i].status === 'vacant') {
-        await this.processEntry({
-          slotId: slots[i].slotId,
-          vehicleId: demoVehicles[i],
-          rfidTag: demoRfids[i],
-        });
+    db.transaction(() => {
+      const now = new Date().toISOString();
+
+      for (const item of demoVehicles) {
+        const slot = db
+          .prepare('SELECT * FROM ParkingSlots WHERE slot_id = ?')
+          .get(item.slotId);
+        if (slot && slot.status === 'vacant') {
+          let vehId = item.vehicleId;
+          const alreadyParked = db
+            .prepare("SELECT 1 FROM ParkingRecords WHERE vehicle_id = ? AND status = 'PARKED'")
+            .get(vehId);
+          if (alreadyParked) {
+            vehId = `DEMO-${item.slotId}-${Math.floor(100 + Math.random() * 900)}`;
+          }
+
+          db.prepare(`
+            UPDATE ParkingSlots
+            SET status = 'occupied',
+                sensor_state = 'HIGH',
+                vehicle_id = ?,
+                rfid_card_id = ?,
+                entry_time = ?,
+                last_updated = ?
+            WHERE slot_id = ?
+          `).run(vehId, item.rfidTag, now, now, item.slotId);
+
+          db.prepare(`
+            INSERT INTO ParkingRecords (
+              vehicle_id, rfid_card_id, slot_id, entry_time, duration_formatted, status
+            ) VALUES (?, ?, ?, ?, 'Active', 'PARKED')
+          `).run(vehId, item.rfidTag, item.slotId, now);
+        }
       }
-    }
 
-    this.recordEvent('PARKING_FULL', 'Demo preset applied: All 5 slots occupied (100% capacity).');
+      this.setStateValue(db, 'rfid_status', 'AUTHORIZED');
+      this.setStateValue(db, 'last_rfid_tag', 'RFID-105');
+      db.prepare("UPDATE Gates SET status = 'CLOSED', last_updated = ? WHERE gate_id = 'GATE-ENTRY'").run(now);
+
+      this.insertEvent(db, {
+        eventType: 'PARKING_FULL',
+        description: 'Demo preset applied: All 5 slots occupied (100% capacity).',
+        timestamp: now,
+      });
+    })();
+
     return this.getDashboardState();
   }
 }

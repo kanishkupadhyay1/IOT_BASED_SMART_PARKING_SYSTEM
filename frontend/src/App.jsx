@@ -17,7 +17,7 @@ const DEFAULT_STATE = {
   rfidStatus: 'IDLE',
   lastRfidTag: null,
   lastEvent: null,
-  dbMode: 'memory',
+  dbMode: 'sqlite',
   slots: [],
   history: [],
 };
@@ -97,7 +97,7 @@ export default function App() {
               Smart Parking Management System
             </h1>
             <p className="text-xs text-slate-400">
-              Hybrid IoT Architecture: Cisco Packet Tracer + Node.js/Express + Socket.IO + MongoDB
+              Hybrid IoT Architecture: Cisco Packet Tracer + Node.js/Express + Socket.IO + SQLite
             </p>
           </div>
 
@@ -115,7 +115,7 @@ export default function App() {
 
             <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium bg-slate-800 text-slate-300 border border-slate-700">
               <Database className="w-3.5 h-3.5 text-sky-400" />
-              {state.dbMode === 'mongodb' ? 'MongoDB Connected' : 'In-Memory Demo Mode'}
+              SQLite Persistent
             </span>
           </div>
         </div>
